@@ -656,7 +656,23 @@ async function exportBackup(){
     showExportText('Backup dati (JSON)', jsonStr);
   }
 }
-function importBackupFile(file){
+// Unisce due elenchi per id: tiene la versione GIÀ presente quando lo stesso id esiste
+// in entrambi (non sovrascrive nulla di locale), e aggiunge in coda i record del file
+// che non esistono ancora qui. Così importare più volte da dispositivi diversi
+// non fa mai perdere dati, né locali né del file.
+function mergeById(localArr, importedArr){
+  const seen = new Set(localArr.map(item => item.id));
+  const merged = localArr.slice();
+  importedArr.forEach(item => {
+    if(item && item.id && !seen.has(item.id)){
+      merged.push(item);
+      seen.add(item.id);
+    }
+  });
+  return merged;
+}
+function importBackupFile(file, mode){
+  mode = mode === 'replace' ? 'replace' : 'merge';
   const reader = new FileReader();
   reader.onload = () => {
     try{
@@ -667,7 +683,7 @@ function importBackupFile(file){
       }
       // se le foto sono state salvate come base64 nel backup, usale direttamente come
       // immagine: funzionano ovunque, senza dipendere dallo storage foto originale.
-      const sheets = data.sheets.map(s => {
+      const importedSheets = data.sheets.map(s => {
         if(Array.isArray(s.immagini)){
           s = Object.assign({}, s, {
             immagini: s.immagini.map(img => (img && img.dataBase64) ? Object.assign({}, img, { url: img.dataBase64 }) : img)
@@ -675,18 +691,33 @@ function importBackupFile(file){
         }
         return s;
       });
-      localStorage.setItem(LS.matches, JSON.stringify(data.matches));
-      localStorage.setItem(LS.teams, JSON.stringify(data.teams));
+
+      let finalMatches, finalTeams, finalSheets;
+      if(mode === 'replace'){
+        finalMatches = data.matches;
+        finalTeams = data.teams;
+        finalSheets = importedSheets;
+      } else {
+        const localMatches = JSON.parse(localStorage.getItem(LS.matches) || '[]');
+        const localTeams = JSON.parse(localStorage.getItem(LS.teams) || '[]');
+        const localSheets = JSON.parse(localStorage.getItem(LS.sheets) || '[]');
+        finalMatches = mergeById(localMatches, data.matches);
+        finalTeams = mergeById(localTeams, data.teams);
+        finalSheets = mergeById(localSheets, importedSheets);
+      }
+
+      localStorage.setItem(LS.matches, JSON.stringify(finalMatches));
+      localStorage.setItem(LS.teams, JSON.stringify(finalTeams));
       try{
-        localStorage.setItem(LS.sheets, JSON.stringify(sheets));
+        localStorage.setItem(LS.sheets, JSON.stringify(finalSheets));
       }catch(quotaErr){
         // spazio esaurito per via delle foto in base64: riprova senza, avvisando l'utente
-        const sheetsNoPhotos = data.sheets.map(s => Object.assign({}, s, { immagini: [] }));
+        const sheetsNoPhotos = finalSheets.map(s => Object.assign({}, s, { immagini: [] }));
         localStorage.setItem(LS.sheets, JSON.stringify(sheetsNoPhotos));
-        toast('Backup ripristinato, ma le foto erano troppo pesanti per lo spazio disponibile e non sono state importate');
+        toast('Backup importato, ma le foto erano troppo pesanti per lo spazio disponibile e non sono state importate');
       }
-      if(data.theme) localStorage.setItem(LS.theme, data.theme);
-      toast('Backup ripristinato, ricarico...');
+      if(mode === 'replace' && data.theme) localStorage.setItem(LS.theme, data.theme);
+      toast(mode === 'replace' ? 'Backup ripristinato, ricarico...' : 'Backup unito, ricarico...');
       setTimeout(()=>location.reload(), 700);
     }catch(e){
       toast('Errore nella lettura del backup');
@@ -1028,12 +1059,18 @@ function renderTopbar(){
       </div>
     ` : ''}
     ${state.backupPanelOpen ? `
-      <div class="theme-picker" style="flex-direction:column;align-items:stretch;gap:8px;min-width:190px;right:60px;">
+      <div class="theme-picker" style="flex-direction:column;align-items:stretch;gap:8px;min-width:220px;right:60px;">
         <button class="btn btn-secondary btn-sm" id="btn-export-backup" style="width:100%;">📤 Esporta backup</button>
         <label class="btn btn-secondary btn-sm" style="width:100%;text-align:center;cursor:pointer;">
-          📥 Importa backup
-          <input type="file" id="input-import-backup" accept="application/json" style="display:none;">
+          📥 Importa e unisci
+          <input type="file" id="input-import-backup-merge" accept="application/json" style="display:none;">
         </label>
+        <div style="font-size:11px;color:var(--text-dim);line-height:1.4;">Unisci: aggiunge solo quello che manca, senza cancellare nulla di quello che hai già qui.</div>
+        <label class="btn btn-secondary btn-sm" style="width:100%;text-align:center;cursor:pointer;opacity:0.75;">
+          ⚠️ Sostituisci tutto
+          <input type="file" id="input-import-backup-replace" accept="application/json" style="display:none;">
+        </label>
+        <div style="font-size:11px;color:var(--text-dim);line-height:1.4;">Sostituisci: cancella tutto quello che hai qui e lo rimpiazza col contenuto del file. Usalo solo se sei sicuro.</div>
       </div>
     ` : ''}
   `;
@@ -1043,9 +1080,18 @@ function renderTopbar(){
   if(bBackup) bBackup.onclick = () => { state.backupPanelOpen = !state.backupPanelOpen; state.themePickerOpen = false; renderTopbar(); };
   const bExport = document.getElementById('btn-export-backup');
   if(bExport) bExport.onclick = () => { exportBackup(); };
-  const inImport = document.getElementById('input-import-backup');
-  if(inImport) inImport.onchange = () => {
-    if(inImport.files && inImport.files[0]) importBackupFile(inImport.files[0]);
+  const inImportMerge = document.getElementById('input-import-backup-merge');
+  if(inImportMerge) inImportMerge.onchange = () => {
+    if(inImportMerge.files && inImportMerge.files[0]) importBackupFile(inImportMerge.files[0], 'merge');
+  };
+  const inImportReplace = document.getElementById('input-import-backup-replace');
+  if(inImportReplace) inImportReplace.onchange = () => {
+    if(inImportReplace.files && inImportReplace.files[0]){
+      const file = inImportReplace.files[0];
+      showConfirm('Sostituire TUTTO con il contenuto di questo file? Quello che hai qui adesso e non è nel file andrà perso.', () => {
+        importBackupFile(file, 'replace');
+      });
+    }
   };
   document.querySelectorAll('[data-theme-id]').forEach(sw => {
     sw.addEventListener('click', () => {
