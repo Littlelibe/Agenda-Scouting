@@ -585,7 +585,8 @@ const LS = {
   teams: 'ssc_teams_v1',
   sheets: 'ssc_sheets_v1',
   theme: 'ssc_theme_v1',
-  seedVersion: 'ssc_seed_version_v1'
+  seedVersion: 'ssc_seed_version_v1',
+  uiState: 'ssc_ui_state_v1'
 };
 const SEED_VERSION = 2;
 function getSeedVersion(){ return parseInt(localStorage.getItem(LS.seedVersion) || '0', 10); }
@@ -911,6 +912,46 @@ const state = {
   scheda: { view: 'list', editingId: null, draft: null, pitchMode: 'player', pitchTeam: 1, pendingArrow: null }
 };
 if(getSeedVersion() < SEED_VERSION) setSeedVersion(SEED_VERSION);
+
+/* ============ SALVATAGGIO/RIPRISTINO SCHERMATA (per non perdere quello che si sta facendo
+   quando si esce dall'app e si rientra) ============ */
+function saveUIState(){
+  try{
+    const snap = {
+      tab: state.tab,
+      scoutView: state.scoutView,
+      calView: state.calView,
+      squadreView: state.squadreView,
+      scheda: {
+        view: state.scheda.view,
+        editingId: state.scheda.editingId,
+        draft: state.scheda.draft
+      }
+    };
+    localStorage.setItem(LS.uiState, JSON.stringify(snap));
+  }catch(e){ /* best-effort: se la memoria è piena non blocchiamo l'app */ }
+}
+function restoreUIState(){
+  try{
+    const raw = localStorage.getItem(LS.uiState);
+    if(!raw) return;
+    const snap = JSON.parse(raw);
+    if(!snap || typeof snap !== 'object') return;
+    if(typeof snap.tab === 'string') state.tab = snap.tab;
+    if(typeof snap.scoutView === 'string') state.scoutView = snap.scoutView;
+    if(typeof snap.calView === 'string') state.calView = snap.calView;
+    if(typeof snap.squadreView === 'string') state.squadreView = snap.squadreView;
+    if(snap.scheda && typeof snap.scheda === 'object'){
+      if(snap.scheda.view === 'form' && snap.scheda.draft && typeof snap.scheda.draft === 'object'){
+        state.scheda.view = 'form';
+        state.scheda.editingId = snap.scheda.editingId || null;
+        state.scheda.draft = snap.scheda.draft;
+      }
+    }
+  }catch(e){ /* dati corrotti: si riparte dalla lista, nessun danno */ }
+}
+window.addEventListener('visibilitychange', () => { if(document.visibilityState === 'hidden') saveUIState(); });
+window.addEventListener('pagehide', saveUIState);
 
 const RATING_GROUPS = {
   'Tecnica': ['Controllo','Passaggio','Dribbling','Tiro','Colpo di testa'],
@@ -1787,6 +1828,26 @@ function openEditSheet(id){
   state.scheda.view = 'form';
   render();
 }
+/* "Seconda visualizzazione": duplica la scheda del giocatore aperta, tenendo tutti i dati
+   uguali (ruolo, valutazioni, campo, foto...) e ripartendo solo dai campi Partita, Data
+   partita e Osservazioni, così una nuova visione dello stesso giocatore non cancella
+   la scheda precedente ma ne crea una nuova collegata alla stessa base dati. */
+function duplicateSheetForSecondViewing(){
+  const src = state.scheda.draft;
+  if(!src) return;
+  let clone;
+  try{ clone = JSON.parse(JSON.stringify(src)); }
+  catch(e){ clone = Object.assign({}, src); }
+  clone.id = uid();
+  clone.partita = '';
+  clone.dataPartita = new Date().toISOString().slice(0,10);
+  clone.osservazioni = '';
+  state.scheda.draft = clone;
+  state.scheda.editingId = null;
+  state.scheda.view = 'form';
+  toast('Nuova visualizzazione creata: compila partita e osservazioni');
+  render();
+}
 function persistDraftSheet(){
   const d = state.scheda.draft;
   const idx = state.sheets.findIndex(s=>s.id===d.id);
@@ -1989,7 +2050,8 @@ function renderSchedaForm(){
 
     <div style="height:8px;"></div>
     <button class="btn btn-primary" id="save-sheet">Salva scheda</button>
-    <button class="btn btn-secondary" id="export-sheet-doc" style="margin-top:8px;">📤 Esporta scheda (testo da copiare)</button>
+    <button class="btn btn-secondary" id="export-sheet-doc" style="margin-top:8px;">📤 Esporta scheda in Word</button>
+    ${state.scheda.editingId ? `<button class="btn btn-secondary" id="second-viewing-sheet" style="margin-top:8px;">🔁 Seconda visualizzazione</button>` : ''}
     ${state.scheda.editingId ? `<button class="btn btn-danger" id="delete-sheet" style="margin-top:8px;">Elimina scheda</button>` : ''}
     <div style="height:20px;"></div>
   `;
@@ -2439,6 +2501,9 @@ function wireSchedaFormEvents(){
   const exportBtn = document.getElementById('export-sheet-doc');
   if(exportBtn) exportBtn.addEventListener('click', exportSchedaAsDoc);
 
+  const secondViewingBtn = document.getElementById('second-viewing-sheet');
+  if(secondViewingBtn) secondViewingBtn.addEventListener('click', duplicateSheetForSecondViewing);
+
   const delBtn = document.getElementById('delete-sheet');
   if(delBtn) delBtn.addEventListener('click', () => {
     showConfirm('Eliminare questa scheda?', () => {
@@ -2662,6 +2727,8 @@ async function exportSchedaAsDoc(){
     }catch(e){ image = null; }
   }
 
+  const docxFilename = `Scheda ${safeName}.docx`;
+
   let downloads = null;
   try{
     downloads = window.claude ? await window.claude.use('downloads') : null;
@@ -2669,13 +2736,28 @@ async function exportSchedaAsDoc(){
   if(downloads){
     try{
       const blob = buildDocxBlob(title, topText, bottomText, image);
-      await downloads.save({ filename: `Scheda ${safeName}.docx`, data: blob });
+      await downloads.save({ filename: docxFilename, data: blob });
       toast('Scheda esportata in Word');
       return;
     }catch(err){
       if(err && err.code === 'declined') return;
-      // qualsiasi altro errore: fallback al testo copiabile
+      // qualsiasi altro errore: prova il download nativo del browser sotto
     }
+  }
+  try{
+    const blob = buildDocxBlob(title, topText, bottomText, image);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = docxFilename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(()=>URL.revokeObjectURL(url), 2000);
+    toast('Scheda esportata in Word');
+    return;
+  }catch(e){
+    // qualsiasi altro errore: fallback al testo copiabile
   }
   showExportText(title, fullText);
 }
@@ -2782,6 +2864,7 @@ function wirePitchSvg(){
 }
 
 applyTheme(localStorage.getItem(LS.theme) || 'glicine');
+restoreUIState();
 render();
 
 /* exposed for debugging in devtools console */
